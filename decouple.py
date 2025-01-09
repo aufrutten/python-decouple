@@ -1,20 +1,23 @@
 # coding: utf-8
 import os
+import pprint
 import sys
 import string
 from shlex import shlex
 from io import open
 from collections import OrderedDict
+from pathlib import Path
 
 # Useful for very coarse version differentiation.
 PYVERSION = sys.version_info
 
-
 if PYVERSION >= (3, 0, 0):
     from configparser import ConfigParser, NoOptionError
+
     text_type = str
 else:
     from ConfigParser import SafeConfigParser as ConfigParser, NoOptionError
+
     text_type = unicode
 
 if PYVERSION >= (3, 2, 0):
@@ -22,13 +25,12 @@ if PYVERSION >= (3, 2, 0):
 else:
     read_config = lambda parser, file: parser.readfp(file)
 
-
 DEFAULT_ENCODING = 'UTF-8'
-
 
 # Python 3.10 don't have strtobool anymore. So we move it here.
 TRUE_VALUES = {"y", "yes", "t", "true", "on", "1"}
 FALSE_VALUES = {"n", "no", "f", "false", "off", "0"}
+
 
 def strtobool(value):
     if isinstance(value, bool):
@@ -89,7 +91,9 @@ class Config(object):
             value = self.repository[option]
         else:
             if isinstance(default, Undefined):
-                raise UndefinedValueError('{} not found. Declare it as envvar or define a default value.'.format(option))
+                raise UndefinedValueError(
+                    '{} not found. Declare it as envvar or define a default value.'.format(option)
+                )
 
             value = default
 
@@ -144,6 +148,7 @@ class RepositoryEnv(RepositoryEmpty):
     """
     Retrieves option keys from .env files with fall back to os.environ.
     """
+
     def __init__(self, source, encoding=DEFAULT_ENCODING):
         self.data = {}
 
@@ -164,6 +169,33 @@ class RepositoryEnv(RepositoryEmpty):
 
     def __getitem__(self, key):
         return self.data[key]
+
+
+class AutoRepositoryEnv(RepositoryEnv):
+    def __init__(self, path):
+        self.path = path
+
+        if not self.path.exists():
+            self.path.touch()
+
+        super().__init__(source=self.path)
+
+    def __contains__(self, key):
+        return key in self.data
+
+    def __getitem__(self, key):
+        return self.data[key] if key in self.data and self.data[key] else None
+
+    def __setitem__(self, key, value):
+        self.data[key] = value
+
+    def read_file(self):
+        super().__init__(source=self.path)
+
+    def write_file(self):
+        with self.path.open("w") as file:
+            for key, value in self.data.items():
+                file.write(f'{key}={value}\n')
 
 
 class RepositorySecret(RepositoryEmpty):
@@ -248,11 +280,64 @@ class AutoConfig(object):
         return self.config(*args, **kwargs)
 
 
+class AutoEnvConfig(AutoConfig):
+    REQUIRE_NAME = "<REQUIRE>"
+
+    def __init__(self, file=Path(os.getcwd()).resolve() / "config.env", write_to_file=False):
+        super().__init__()
+        self.used_fields = {}
+        self.require_fields = {}
+        self.environ = AutoRepositoryEnv(file)
+
+        self.write_to_file = write_to_file
+
+    def __del__(self):
+        if self.write_to_file:
+            self.write()
+
+    def __call__(self, *args, **kwargs):
+        """It calls from the config("EMAIL_ADDRESS") and when it used"""
+        self.environ.read_file()
+        key = args[0] if len(args) >= 1 else None
+
+        try:
+            # Search in [os.environ, default_value]
+            self.used_fields[key] = super().__call__(*args, **kwargs)
+
+        except UndefinedValueError:
+            self.handle_undefined_value(key)
+
+        self.check_key_on_require_value(key)
+
+        return self.used_fields[key]
+
+    def write(self):
+        self.environ.read_file()
+        self.environ.data = {k: self.environ.data.copy().get(k, v) for k, v in self.used_fields.items()}
+        self.environ.write_file()
+
+    def check_key_on_require_value(self, key):
+        if self.used_fields[key] == self.REQUIRE_NAME:
+            self.require_fields[key] = self.REQUIRE_NAME
+
+    def handle_undefined_value(self, key):
+        if self.environ[key] and self.environ[key] != self.REQUIRE_NAME:
+            self.used_fields[key] = self.environ[key]
+        else:
+            self.used_fields[key] = self.require_fields[key] = self.REQUIRE_NAME
+
+    def throw_exception(self):
+        if self.require_fields.keys():
+            raise UndefinedValueError(f'{str(self.require_fields)} not found. Declare it as envvar')
+
+
 # A pré-instantiated AutoConfig to improve decouple's usability
 # now just import config and start using with no configuration.
-config = AutoConfig()
+config = AutoEnvConfig()
+
 
 # Helpers
+
 
 class Csv(object):
     """
@@ -309,8 +394,6 @@ class Choices(object):
     def __call__(self, value):
         transform = self.cast(value)
         if transform not in self._valid_values:
-            raise ValueError((
-                    'Value not in list: {!r}; valid values are {!r}'
-                ).format(value, self._valid_values))
+            raise ValueError('Value not in list: {!r}; valid values are {!r}'.format(value, self._valid_values))
         else:
             return transform
